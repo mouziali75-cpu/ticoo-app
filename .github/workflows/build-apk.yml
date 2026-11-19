@@ -1,0 +1,351 @@
+name: Build Ticoo APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Generate Android project
+        run: |
+          set -e
+          mkdir -p ticoo-android ticoo-android/app ticoo-android/app/src/main ticoo-android/app/src/main/java/org/ticoo/app ticoo-android/app/src/main/res/mipmap-xxxhdpi
+          cat > ticoo-android/settings.gradle <<'TICOO_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "TicooApp"
+          include ':app'
+          TICOO_EOF
+          cat > ticoo-android/build.gradle <<'TICOO_EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          TICOO_EOF
+          cat > ticoo-android/gradle.properties <<'TICOO_EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          TICOO_EOF
+          cat > ticoo-android/app/build.gradle <<'TICOO_EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'org.ticoo.app'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'org.ticoo.app'
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+
+          dependencies {
+              implementation 'androidx.work:work-runtime:2.9.1'
+          }
+          TICOO_EOF
+          cat > ticoo-android/app/src/main/AndroidManifest.xml <<'TICOO_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="Ticoo"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          TICOO_EOF
+          cat > ticoo-android/app/src/main/java/org/ticoo/app/MainActivity.java <<'TICOO_EOF'
+          package org.ticoo.app;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.content.ActivityNotFoundException;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.graphics.Color;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.webkit.CookieManager;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceError;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+
+          import androidx.work.ExistingPeriodicWorkPolicy;
+          import androidx.work.PeriodicWorkRequest;
+          import androidx.work.WorkManager;
+
+          import java.util.concurrent.TimeUnit;
+
+          public class MainActivity extends Activity {
+
+              // ===== Settings you can change =====
+              static final String START_URL = "https://ticoo.wispbyte.org/app/";
+
+              // Pages from these sites open inside the app (subdomains included).
+              static final String[] ALLOWED_HOSTS = {
+                      "ticoo.wispbyte.org",
+                      "discord.com",
+                      "discordapp.com",
+                      "top.gg"
+              };
+
+              // true  = any other site opens in the phone browser
+              // false = any other site opens inside the app too
+              static final boolean OPEN_OTHER_LINKS_EXTERNALLY = true;
+
+              // Reminder interval in hours
+              static final long REMINDER_HOURS = 12;
+              // ====================================
+
+              private WebView web;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  getWindow().setStatusBarColor(Color.parseColor("#0F1117"));
+                  getWindow().setNavigationBarColor(Color.parseColor("#0F1117"));
+
+                  web = new WebView(this);
+                  web.setBackgroundColor(Color.parseColor("#0F1117"));
+                  setContentView(web);
+
+                  WebSettings s = web.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setDatabaseEnabled(true);
+                  s.setJavaScriptCanOpenWindowsAutomatically(true);
+                  String ua = s.getUserAgentString().replace("; wv", "").replace("Version/4.0 ", "");
+                  s.setUserAgentString(ua + " TicooApp/1.0");
+
+                  CookieManager cm = CookieManager.getInstance();
+                  cm.setAcceptCookie(true);
+                  cm.setAcceptThirdPartyCookies(web, true);
+
+                  web.setWebChromeClient(new WebChromeClient());
+                  web.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                          Uri u = request.getUrl();
+                          String scheme = u.getScheme();
+                          if ("http".equals(scheme) || "https".equals(scheme)) {
+                              if (isAllowed(u.getHost()) || !OPEN_OTHER_LINKS_EXTERNALLY) {
+                                  return false;
+                              }
+                          }
+                          openExternal(u);
+                          return true;
+                      }
+
+                      @Override
+                      public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
+                          if (request.isForMainFrame()) {
+                              String html = "<html><body style='background:#0f1117;color:#f2f3f5;"
+                                      + "font-family:sans-serif;text-align:center;padding-top:30vh'>"
+                                      + "<h2>No connection</h2>"
+                                      + "<p><a style='color:#5865F2;font-size:20px' href='" + START_URL + "'>Retry</a></p>"
+                                      + "</body></html>";
+                              view.loadDataWithBaseURL(null, html, "text/html", "utf-8", null);
+                          }
+                      }
+                  });
+
+                  web.setDownloadListener((url, userAgent, contentDisposition, mimetype, contentLength) ->
+                          openExternal(Uri.parse(url)));
+
+                  if (savedInstanceState != null) {
+                      web.restoreState(savedInstanceState);
+                  } else {
+                      web.loadUrl(START_URL);
+                  }
+
+                  setupReminders();
+              }
+
+              private boolean isAllowed(String host) {
+                  if (host == null) return false;
+                  for (String h : ALLOWED_HOSTS) {
+                      if (host.equals(h) || host.endsWith("." + h)) return true;
+                  }
+                  return false;
+              }
+
+              private void openExternal(Uri uri) {
+                  try {
+                      startActivity(new Intent(Intent.ACTION_VIEW, uri));
+                  } catch (ActivityNotFoundException ignored) {
+                  }
+              }
+
+              private void setupReminders() {
+                  if (Build.VERSION.SDK_INT >= 33
+                          && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                          != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1);
+                  }
+                  PeriodicWorkRequest req = new PeriodicWorkRequest.Builder(
+                          ReminderWorker.class, REMINDER_HOURS, TimeUnit.HOURS)
+                          .setInitialDelay(REMINDER_HOURS, TimeUnit.HOURS)
+                          .build();
+                  WorkManager.getInstance(this).enqueueUniquePeriodicWork(
+                          "ticoo_reminder", ExistingPeriodicWorkPolicy.KEEP, req);
+              }
+
+              @Override
+              protected void onSaveInstanceState(Bundle outState) {
+                  super.onSaveInstanceState(outState);
+                  web.saveState(outState);
+              }
+
+              @Override
+              protected void onPause() {
+                  super.onPause();
+                  CookieManager.getInstance().flush();
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (web.canGoBack()) {
+                      web.goBack();
+                  } else {
+                      super.onBackPressed();
+                  }
+              }
+          }
+          TICOO_EOF
+          cat > ticoo-android/app/src/main/java/org/ticoo/app/ReminderWorker.java <<'TICOO_EOF'
+          package org.ticoo.app;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.os.Build;
+
+          import androidx.work.Worker;
+          import androidx.work.WorkerParameters;
+
+          public class ReminderWorker extends Worker {
+
+              public ReminderWorker(Context context, WorkerParameters params) {
+                  super(context, params);
+              }
+
+              @Override
+              public Result doWork() {
+                  Context c = getApplicationContext();
+                  NotificationManager nm =
+                          (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+                  String channelId = "ticoo_reminders";
+
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      nm.createNotificationChannel(new NotificationChannel(
+                              channelId, "Reminders", NotificationManager.IMPORTANCE_DEFAULT));
+                  }
+
+                  Intent open = new Intent(c, MainActivity.class);
+                  open.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                  PendingIntent pi = PendingIntent.getActivity(
+                          c, 0, open, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+
+                  Notification.Builder b = Build.VERSION.SDK_INT >= 26
+                          ? new Notification.Builder(c, channelId)
+                          : new Notification.Builder(c);
+                  b.setSmallIcon(android.R.drawable.ic_dialog_info)
+                          .setContentTitle("Ticoo")
+                          .setContentText("Reminder: check your dashboard and your server.")
+                          .setContentIntent(pi)
+                          .setAutoCancel(true);
+
+                  nm.notify(1, b.build());
+                  return Result.success();
+              }
+          }
+          TICOO_EOF
+
+      - name: Download app icon
+        run: |
+          set -e
+          curl -fsSL -A "Mozilla/5.0" -o ticoo-android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png https://ticoo.wispbyte.org/app/icon-512.png
+          head -c 4 ticoo-android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png | grep -aq PNG || { echo "Icon download failed"; exit 1; }
+
+      - name: Build APK
+        working-directory: ticoo-android
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Rename APK
+        run: cp ticoo-android/app/build/outputs/apk/debug/app-debug.apk Ticoo.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Ticoo-APK
+          path: Ticoo.apk
+
+      - name: Publish release
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Ticoo APK build ${{ github.run_number }}
+          files: Ticoo.apk
