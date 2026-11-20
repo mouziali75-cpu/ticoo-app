@@ -1,1 +1,1111 @@
+name: Build Ticoo APK
 
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Generate Android project
+        run: |
+          set -e
+          mkdir -p ticoo-android ticoo-android/app ticoo-android/app/src/main ticoo-android/app/src/main/java/org/ticoo/app ticoo-android/app/src/main/res/drawable ticoo-android/app/src/main/res/mipmap-xxxhdpi
+          cat > ticoo-android/settings.gradle <<'TICOO_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "TicooApp"
+          include ':app'
+          TICOO_EOF
+          cat > ticoo-android/build.gradle <<'TICOO_EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          TICOO_EOF
+          cat > ticoo-android/gradle.properties <<'TICOO_EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          TICOO_EOF
+          cat > ticoo-android/app/build.gradle <<'TICOO_EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'org.ticoo.app'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'org.ticoo.app'
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+
+          dependencies {
+              implementation 'androidx.work:work-runtime:2.9.1'
+          }
+          TICOO_EOF
+          cat > ticoo-android/app/src/main/AndroidManifest.xml <<'TICOO_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="Ticoo"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          TICOO_EOF
+          cat > ticoo-android/app/src/main/java/org/ticoo/app/MainActivity.java <<'TICOO_EOF'
+          package org.ticoo.app;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.content.ActivityNotFoundException;
+          import android.content.ClipData;
+          import android.content.ClipboardManager;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.content.pm.PackageManager;
+          import android.content.res.ColorStateList;
+          import android.graphics.Bitmap;
+          import android.graphics.Color;
+          import android.graphics.PorterDuff;
+          import android.graphics.drawable.ColorDrawable;
+          import android.graphics.drawable.Drawable;
+          import android.graphics.drawable.GradientDrawable;
+          import android.graphics.drawable.StateListDrawable;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.text.Editable;
+          import android.text.Spannable;
+          import android.text.SpannableStringBuilder;
+          import android.text.TextUtils;
+          import android.text.TextWatcher;
+          import android.text.style.ForegroundColorSpan;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.view.inputmethod.EditorInfo;
+          import android.view.inputmethod.InputMethodManager;
+          import android.webkit.CookieManager;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceError;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebSettings;
+          import android.webkit.WebStorage;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.widget.CheckBox;
+          import android.widget.EditText;
+          import android.widget.ImageView;
+          import android.widget.LinearLayout;
+          import android.widget.PopupWindow;
+          import android.widget.ProgressBar;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import androidx.work.ExistingPeriodicWorkPolicy;
+          import androidx.work.PeriodicWorkRequest;
+          import androidx.work.WorkManager;
+
+          import java.util.concurrent.TimeUnit;
+
+          public class MainActivity extends Activity {
+
+              // ===== Settings you can change =====
+              static final String BASE = "https://ticoo.wispbyte.org";
+              static final String START_URL = BASE + "/app/";
+
+              // Pages from these sites open inside the app (subdomains included).
+              static final String[] ALLOWED_HOSTS = {
+                      "ticoo.wispbyte.org",
+                      "discord.com",
+                      "discordapp.com",
+                      "top.gg",
+                      "botlist.me"
+              };
+
+              // true  = any other site opens in the phone browser
+              // false = any other site opens inside the app too
+              static final boolean OPEN_OTHER_LINKS_EXTERNALLY = true;
+
+              // Vote reminder interval in hours
+              static final long REMINDER_HOURS = 12;
+              // ====================================
+
+              static final String DESKTOP_UA =
+                      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                              + "Chrome/124.0.0.0 Safari/537.36 TicooApp/1.0";
+              static final int FILE_REQ = 2;
+
+              static final int BG = Color.parseColor("#0F1117");
+              static final int BAR = Color.parseColor("#161922");
+              static final int PILL = Color.parseColor("#262A38");
+              static final int MUTED = Color.parseColor("#9AA0B4");
+              static final int ACCENT = Color.parseColor("#5865F2");
+              static final int PRESSED = Color.parseColor("#2B3040");
+
+              private WebView web;
+              private ProgressBar progress;
+              private TextView urlText;
+              private ImageView lockIcon;
+              private ImageView reloadBtn;
+              private LinearLayout findBar;
+              private EditText findInput;
+              private PopupWindow menuPopup;
+              private String mobileUa;
+              private boolean desktop;
+              private boolean loading;
+              private SharedPreferences prefs;
+              private ValueCallback<Uri[]> fileCallback;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  prefs = getSharedPreferences("ticoo", MODE_PRIVATE);
+                  desktop = prefs.getBoolean("desktop", false);
+
+                  getWindow().setStatusBarColor(BAR);
+                  getWindow().setNavigationBarColor(BG);
+
+                  web = new WebView(this);
+                  web.setBackgroundColor(BG);
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setBackgroundColor(BG);
+
+                  root.addView(buildTopBar(), new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, dp(56)));
+
+                  progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+                  progress.setMax(100);
+                  progress.setProgressTintList(ColorStateList.valueOf(ACCENT));
+                  progress.setVisibility(View.INVISIBLE);
+                  root.addView(progress, new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, dp(2)));
+
+                  root.addView(buildFindBar(), new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, dp(48)));
+
+                  root.addView(web, new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+                  setContentView(root);
+
+                  WebSettings s = web.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setDatabaseEnabled(true);
+                  s.setJavaScriptCanOpenWindowsAutomatically(true);
+                  s.setSupportZoom(true);
+                  s.setBuiltInZoomControls(true);
+                  s.setDisplayZoomControls(false);
+                  s.setLoadWithOverviewMode(true);
+                  s.setUseWideViewPort(true);
+                  mobileUa = s.getUserAgentString().replace("; wv", "").replace("Version/4.0 ", "")
+                          + " TicooApp/1.0";
+                  applyMode();
+
+                  CookieManager cm = CookieManager.getInstance();
+                  cm.setAcceptCookie(true);
+                  cm.setAcceptThirdPartyCookies(web, true);
+
+                  web.setWebChromeClient(new WebChromeClient() {
+                      @Override
+                      public void onProgressChanged(WebView view, int newProgress) {
+                          progress.setProgress(newProgress);
+                          progress.setVisibility(newProgress >= 100 ? View.INVISIBLE : View.VISIBLE);
+                      }
+
+                      @Override
+                      public boolean onShowFileChooser(WebView webView, ValueCallback<Uri[]> callback,
+                                                       FileChooserParams params) {
+                          if (fileCallback != null) {
+                              fileCallback.onReceiveValue(null);
+                          }
+                          fileCallback = callback;
+                          try {
+                              startActivityForResult(params.createIntent(), FILE_REQ);
+                          } catch (ActivityNotFoundException e) {
+                              fileCallback = null;
+                              return false;
+                          }
+                          return true;
+                      }
+                  });
+
+                  web.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                          Uri u = request.getUrl();
+                          String scheme = u.getScheme();
+                          if ("http".equals(scheme) || "https".equals(scheme)) {
+                              if (isAllowed(u.getHost()) || !OPEN_OTHER_LINKS_EXTERNALLY) {
+                                  return false;
+                              }
+                          }
+                          openExternal(u);
+                          return true;
+                      }
+
+                      @Override
+                      public void onPageStarted(WebView view, String url, Bitmap favicon) {
+                          loading = true;
+                          reloadBtn.setImageResource(R.drawable.ic_close);
+                          updateUrlBar(url);
+                      }
+
+                      @Override
+                      public void doUpdateVisitedHistory(WebView view, String url, boolean isReload) {
+                          updateUrlBar(url);
+                      }
+
+                      @Override
+                      public void onPageFinished(WebView view, String url) {
+                          loading = false;
+                          reloadBtn.setImageResource(R.drawable.ic_refresh);
+                          updateUrlBar(url);
+                          CookieManager.getInstance().flush();
+                          if (desktop) {
+                              view.evaluateJavascript(
+                                      "(function(){var m=document.querySelector('meta[name=viewport]');"
+                                              + "if(!m){m=document.createElement('meta');m.name='viewport';"
+                                              + "document.head.appendChild(m);}"
+                                              + "m.setAttribute('content','width=1100');})();", null);
+                          }
+                      }
+
+                      @Override
+                      public void onReceivedError(WebView view, WebResourceRequest request,
+                                                  WebResourceError error) {
+                          if (request.isForMainFrame()) {
+                              String html = "<html><body style='background:#0f1117;color:#f2f3f5;"
+                                      + "font-family:sans-serif;text-align:center;padding-top:30vh'>"
+                                      + "<h2>No connection</h2>"
+                                      + "<p><a style='color:#5865F2;font-size:20px' href='" + START_URL
+                                      + "'>Retry</a></p></body></html>";
+                              view.loadDataWithBaseURL(null, html, "text/html", "utf-8", null);
+                          }
+                      }
+                  });
+
+                  web.setDownloadListener((url, userAgent, contentDisposition, mimetype, contentLength) ->
+                          openExternal(Uri.parse(url)));
+
+                  if (savedInstanceState != null) {
+                      web.restoreState(savedInstanceState);
+                  } else {
+                      web.loadUrl(targetFromIntent(getIntent()));
+                  }
+
+                  setupReminders();
+              }
+
+              // ---------- Top bar (Chrome style) ----------
+
+              private LinearLayout buildTopBar() {
+                  LinearLayout top = new LinearLayout(this);
+                  top.setOrientation(LinearLayout.HORIZONTAL);
+                  top.setGravity(Gravity.CENTER_VERTICAL);
+                  top.setBackgroundColor(BAR);
+                  top.setPadding(dp(6), dp(6), dp(2), dp(6));
+
+                  top.addView(iconButton(R.drawable.ic_home, v -> web.loadUrl(START_URL)),
+                          new LinearLayout.LayoutParams(dp(44), dp(44)));
+
+                  LinearLayout pill = new LinearLayout(this);
+                  pill.setOrientation(LinearLayout.HORIZONTAL);
+                  pill.setGravity(Gravity.CENTER_VERTICAL);
+                  GradientDrawable pbg = new GradientDrawable();
+                  pbg.setColor(PILL);
+                  pbg.setCornerRadius(dp(22));
+                  pill.setBackground(pbg);
+                  pill.setPadding(dp(14), 0, dp(2), 0);
+
+                  lockIcon = new ImageView(this);
+                  lockIcon.setImageResource(R.drawable.ic_lock);
+                  lockIcon.setColorFilter(MUTED, PorterDuff.Mode.SRC_IN);
+                  pill.addView(lockIcon, new LinearLayout.LayoutParams(dp(14), dp(14)));
+
+                  urlText = new TextView(this);
+                  urlText.setSingleLine(true);
+                  urlText.setEllipsize(TextUtils.TruncateAt.END);
+                  urlText.setTextSize(14f);
+                  urlText.setTextColor(Color.WHITE);
+                  urlText.setGravity(Gravity.CENTER_VERTICAL);
+                  urlText.setPadding(dp(8), 0, dp(4), 0);
+                  urlText.setText("Ticoo");
+                  pill.addView(urlText, new LinearLayout.LayoutParams(
+                          0, LinearLayout.LayoutParams.MATCH_PARENT, 1f));
+
+                  reloadBtn = iconButton(R.drawable.ic_refresh, v -> {
+                      if (loading) {
+                          web.stopLoading();
+                      } else {
+                          web.reload();
+                      }
+                  });
+                  pill.addView(reloadBtn, new LinearLayout.LayoutParams(dp(40), dp(40)));
+
+                  LinearLayout.LayoutParams pillLp = new LinearLayout.LayoutParams(0, dp(44), 1f);
+                  pillLp.setMargins(dp(6), 0, dp(2), 0);
+                  top.addView(pill, pillLp);
+
+                  top.addView(iconButton(R.drawable.ic_more, v -> showMenu(v)),
+                          new LinearLayout.LayoutParams(dp(44), dp(44)));
+                  return top;
+              }
+
+              private LinearLayout buildFindBar() {
+                  findBar = new LinearLayout(this);
+                  findBar.setOrientation(LinearLayout.HORIZONTAL);
+                  findBar.setGravity(Gravity.CENTER_VERTICAL);
+                  findBar.setBackgroundColor(BAR);
+                  findBar.setPadding(dp(14), 0, dp(4), 0);
+                  findBar.setVisibility(View.GONE);
+
+                  findInput = new EditText(this);
+                  findInput.setHint("Find in page");
+                  findInput.setHintTextColor(MUTED);
+                  findInput.setTextColor(Color.WHITE);
+                  findInput.setTextSize(15f);
+                  findInput.setSingleLine(true);
+                  findInput.setBackgroundColor(Color.TRANSPARENT);
+                  findInput.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
+                  findInput.addTextChangedListener(new TextWatcher() {
+                      @Override
+                      public void beforeTextChanged(CharSequence s, int start, int count, int after) {
+                      }
+
+                      @Override
+                      public void onTextChanged(CharSequence s, int start, int before, int count) {
+                      }
+
+                      @Override
+                      public void afterTextChanged(Editable s) {
+                          String q = s.toString();
+                          if (q.isEmpty()) {
+                              web.clearMatches();
+                          } else {
+                              web.findAllAsync(q);
+                          }
+                      }
+                  });
+                  findInput.setOnEditorActionListener((v, actionId, event) -> {
+                      web.findNext(true);
+                      return true;
+                  });
+                  findBar.addView(findInput, new LinearLayout.LayoutParams(
+                          0, LinearLayout.LayoutParams.MATCH_PARENT, 1f));
+
+                  findBar.addView(iconButton(R.drawable.ic_up, v -> web.findNext(false)),
+                          new LinearLayout.LayoutParams(dp(44), dp(44)));
+                  findBar.addView(iconButton(R.drawable.ic_down, v -> web.findNext(true)),
+                          new LinearLayout.LayoutParams(dp(44), dp(44)));
+                  findBar.addView(iconButton(R.drawable.ic_close, v -> closeFind()),
+                          new LinearLayout.LayoutParams(dp(44), dp(44)));
+                  return findBar;
+              }
+
+              private void openFind() {
+                  findBar.setVisibility(View.VISIBLE);
+                  findInput.requestFocus();
+                  InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+                  if (imm != null) {
+                      imm.showSoftInput(findInput, InputMethodManager.SHOW_IMPLICIT);
+                  }
+              }
+
+              private void closeFind() {
+                  web.clearMatches();
+                  findInput.setText("");
+                  findBar.setVisibility(View.GONE);
+                  InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+                  if (imm != null) {
+                      imm.hideSoftInputFromWindow(findInput.getWindowToken(), 0);
+                  }
+                  web.requestFocus();
+              }
+
+              private void updateUrlBar(String url) {
+                  if (url == null || !url.startsWith("http")) {
+                      urlText.setText("Ticoo");
+                      lockIcon.setVisibility(View.GONE);
+                      return;
+                  }
+                  Uri u = Uri.parse(url);
+                  String host = u.getHost() == null ? url : u.getHost();
+                  String rest = u.getEncodedPath() == null ? "" : u.getEncodedPath();
+                  if (u.getEncodedQuery() != null) {
+                      rest = rest + "?" + u.getEncodedQuery();
+                  }
+                  if ("/".equals(rest)) {
+                      rest = "";
+                  }
+                  SpannableStringBuilder sb = new SpannableStringBuilder(host);
+                  int hl = host.length();
+                  sb.append(rest);
+                  if (rest.length() > 0) {
+                      sb.setSpan(new ForegroundColorSpan(MUTED), hl, sb.length(),
+                              Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                  }
+                  urlText.setText(sb);
+                  lockIcon.setVisibility("https".equals(u.getScheme()) ? View.VISIBLE : View.GONE);
+              }
+
+              // ---------- Chrome-like menu ----------
+
+              private void showMenu(View anchor) {
+                  if (menuPopup != null && menuPopup.isShowing()) {
+                      menuPopup.dismiss();
+                      return;
+                  }
+                  LinearLayout menu = new LinearLayout(this);
+                  menu.setOrientation(LinearLayout.VERTICAL);
+                  GradientDrawable bgd = new GradientDrawable();
+                  bgd.setColor(Color.parseColor("#1B1D27"));
+                  bgd.setCornerRadius(dp(18));
+                  bgd.setStroke(dp(1), Color.parseColor("#2A2E3D"));
+                  menu.setBackground(bgd);
+                  menu.setPadding(dp(6), dp(6), dp(6), dp(6));
+
+                  // top row: back / forward / reload / share
+                  LinearLayout row = new LinearLayout(this);
+                  row.setOrientation(LinearLayout.HORIZONTAL);
+                  row.addView(menuIcon(R.drawable.ic_back, web.canGoBack(), v -> {
+                      closeMenu();
+                      web.goBack();
+                  }), rowParams());
+                  row.addView(menuIcon(R.drawable.ic_forward, web.canGoForward(), v -> {
+                      closeMenu();
+                      web.goForward();
+                  }), rowParams());
+                  row.addView(menuIcon(R.drawable.ic_refresh, true, v -> {
+                      closeMenu();
+                      web.reload();
+                  }), rowParams());
+                  row.addView(menuIcon(R.drawable.ic_share, true, v -> {
+                      closeMenu();
+                      shareLink();
+                  }), rowParams());
+                  menu.addView(row, new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, dp(48)));
+                  menu.addView(divider());
+
+                  menu.addView(menuItem(R.drawable.ic_desktop, "Desktop site", Boolean.valueOf(desktop), v -> {
+                      closeMenu();
+                      toggleDesktop();
+                  }));
+                  menu.addView(menuItem(R.drawable.ic_search, "Find in page", null, v -> {
+                      closeMenu();
+                      openFind();
+                  }));
+                  menu.addView(menuItem(R.drawable.ic_copy, "Copy link", null, v -> {
+                      closeMenu();
+                      copyLink();
+                  }));
+                  menu.addView(menuItem(R.drawable.ic_open, "Open in browser", null, v -> {
+                      closeMenu();
+                      String url = web.getUrl();
+                      if (url != null && url.startsWith("http")) {
+                          openExternal(Uri.parse(url));
+                      }
+                  }));
+                  menu.addView(divider());
+                  menu.addView(menuItem(R.drawable.ic_logout, "Clear data and log out", null, v -> {
+                      closeMenu();
+                      clearData();
+                  }));
+
+                  PopupWindow pw = new PopupWindow(menu, dp(264), ViewGroup.LayoutParams.WRAP_CONTENT, true);
+                  pw.setElevation(dp(10));
+                  pw.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+                  pw.setOutsideTouchable(true);
+                  menuPopup = pw;
+                  pw.showAsDropDown(anchor, 0, dp(2), Gravity.END);
+              }
+
+              private void closeMenu() {
+                  if (menuPopup != null) {
+                      menuPopup.dismiss();
+                  }
+              }
+
+              private LinearLayout.LayoutParams rowParams() {
+                  return new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f);
+              }
+
+              private View divider() {
+                  View d = new View(this);
+                  d.setBackgroundColor(Color.parseColor("#2A2E3D"));
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, dp(1));
+                  lp.setMargins(dp(8), dp(4), dp(8), dp(4));
+                  d.setLayoutParams(lp);
+                  return d;
+              }
+
+              private ImageView menuIcon(int res, boolean enabled, View.OnClickListener l) {
+                  ImageView iv = new ImageView(this);
+                  iv.setImageResource(res);
+                  iv.setScaleType(ImageView.ScaleType.CENTER);
+                  iv.setColorFilter(Color.WHITE, PorterDuff.Mode.SRC_IN);
+                  iv.setBackground(pressBg(dp(12)));
+                  if (enabled) {
+                      iv.setOnClickListener(l);
+                  } else {
+                      iv.setAlpha(0.35f);
+                  }
+                  return iv;
+              }
+
+              private View menuItem(int iconRes, String label, Boolean checked, View.OnClickListener l) {
+                  LinearLayout r = new LinearLayout(this);
+                  r.setOrientation(LinearLayout.HORIZONTAL);
+                  r.setGravity(Gravity.CENTER_VERTICAL);
+                  r.setPadding(dp(14), 0, dp(10), 0);
+                  r.setBackground(pressBg(dp(12)));
+                  r.setOnClickListener(l);
+
+                  ImageView iv = new ImageView(this);
+                  iv.setImageResource(iconRes);
+                  iv.setColorFilter(Color.parseColor("#C8CCD8"), PorterDuff.Mode.SRC_IN);
+                  r.addView(iv, new LinearLayout.LayoutParams(dp(22), dp(22)));
+
+                  TextView tv = new TextView(this);
+                  tv.setText(label);
+                  tv.setTextColor(Color.WHITE);
+                  tv.setTextSize(15.5f);
+                  tv.setPadding(dp(16), 0, 0, 0);
+                  r.addView(tv, new LinearLayout.LayoutParams(
+                          0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+                  if (checked != null) {
+                      CheckBox cb = new CheckBox(this);
+                      cb.setChecked(checked.booleanValue());
+                      cb.setClickable(false);
+                      cb.setFocusable(false);
+                      cb.setButtonTintList(new ColorStateList(
+                              new int[][]{new int[]{android.R.attr.state_checked}, new int[]{}},
+                              new int[]{ACCENT, MUTED}));
+                      r.addView(cb, new LinearLayout.LayoutParams(
+                              LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+                  }
+                  r.setLayoutParams(new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, dp(50)));
+                  return r;
+              }
+
+              private ImageView iconButton(int res, View.OnClickListener l) {
+                  ImageView iv = new ImageView(this);
+                  iv.setImageResource(res);
+                  iv.setScaleType(ImageView.ScaleType.CENTER);
+                  iv.setColorFilter(Color.WHITE, PorterDuff.Mode.SRC_IN);
+                  iv.setBackground(pressBg(dp(22)));
+                  iv.setOnClickListener(l);
+                  return iv;
+              }
+
+              private Drawable pressBg(float radiusPx) {
+                  GradientDrawable pressed = new GradientDrawable();
+                  pressed.setColor(PRESSED);
+                  pressed.setCornerRadius(radiusPx);
+                  StateListDrawable sl = new StateListDrawable();
+                  sl.addState(new int[]{android.R.attr.state_pressed}, pressed);
+                  sl.addState(new int[]{}, new ColorDrawable(Color.TRANSPARENT));
+                  return sl;
+              }
+
+              private int dp(int v) {
+                  return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
+              }
+
+              // ---------- Actions ----------
+
+              private void applyMode() {
+                  web.getSettings().setUserAgentString(desktop ? DESKTOP_UA : mobileUa);
+              }
+
+              private void toggleDesktop() {
+                  desktop = !desktop;
+                  prefs.edit().putBoolean("desktop", desktop).apply();
+                  applyMode();
+                  String u = web.getUrl();
+                  if (u != null && u.startsWith("http")) {
+                      web.loadUrl(u);
+                  } else {
+                      web.reload();
+                  }
+                  Toast.makeText(this, desktop ? "Desktop site on" : "Desktop site off",
+                          Toast.LENGTH_SHORT).show();
+              }
+
+              private void copyLink() {
+                  String url = web.getUrl();
+                  if (url == null) return;
+                  ClipboardManager cb = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                  cb.setPrimaryClip(ClipData.newPlainText("link", url));
+                  Toast.makeText(this, "Link copied", Toast.LENGTH_SHORT).show();
+              }
+
+              private void shareLink() {
+                  String url = web.getUrl();
+                  if (url == null) return;
+                  Intent send = new Intent(Intent.ACTION_SEND);
+                  send.setType("text/plain");
+                  send.putExtra(Intent.EXTRA_TEXT, url);
+                  startActivity(Intent.createChooser(send, "Share link"));
+              }
+
+              private void clearData() {
+                  new AlertDialog.Builder(this)
+                          .setTitle("Log out?")
+                          .setMessage("This clears cookies and saved site data. You will have to log in again.")
+                          .setNegativeButton("Cancel", null)
+                          .setPositiveButton("Log out", (d, w) -> {
+                              CookieManager.getInstance().removeAllCookies(null);
+                              CookieManager.getInstance().flush();
+                              WebStorage.getInstance().deleteAllData();
+                              web.clearCache(true);
+                              web.loadUrl(START_URL);
+                              Toast.makeText(this, "Logged out", Toast.LENGTH_SHORT).show();
+                          })
+                          .show();
+              }
+
+              // ---------- Helpers ----------
+
+              private boolean isAllowed(String host) {
+                  if (host == null) return false;
+                  for (String h : ALLOWED_HOSTS) {
+                      if (host.equals(h) || host.endsWith("." + h)) return true;
+                  }
+                  return false;
+              }
+
+              private void openExternal(Uri uri) {
+                  try {
+                      startActivity(new Intent(Intent.ACTION_VIEW, uri));
+                  } catch (ActivityNotFoundException ignored) {
+                  }
+              }
+
+              // A reminder notification carries the page to open (for example /vote).
+              private String targetFromIntent(Intent in) {
+                  if (in == null) return START_URL;
+                  String u = in.getStringExtra("url");
+                  if (u == null || u.isEmpty()) return START_URL;
+                  if (u.startsWith("/")) return BASE + u;
+                  Uri p = Uri.parse(u);
+                  if ("https".equals(p.getScheme()) && isAllowed(p.getHost())) return u;
+                  return START_URL;
+              }
+
+              @Override
+              protected void onNewIntent(Intent intent) {
+                  super.onNewIntent(intent);
+                  setIntent(intent);
+                  String u = intent.getStringExtra("url");
+                  if (u != null && !u.isEmpty()) {
+                      web.loadUrl(targetFromIntent(intent));
+                  }
+              }
+
+              private void setupReminders() {
+                  if (Build.VERSION.SDK_INT >= 33
+                          && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                          != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1);
+                  }
+                  PeriodicWorkRequest req = new PeriodicWorkRequest.Builder(
+                          ReminderWorker.class, REMINDER_HOURS, TimeUnit.HOURS)
+                          .setInitialDelay(REMINDER_HOURS, TimeUnit.HOURS)
+                          .build();
+                  WorkManager.getInstance(this).enqueueUniquePeriodicWork(
+                          "ticoo_reminder", ExistingPeriodicWorkPolicy.KEEP, req);
+              }
+
+              @Override
+              protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  if (requestCode == FILE_REQ) {
+                      if (fileCallback != null) {
+                          fileCallback.onReceiveValue(
+                                  WebChromeClient.FileChooserParams.parseResult(resultCode, data));
+                          fileCallback = null;
+                      }
+                      return;
+                  }
+                  super.onActivityResult(requestCode, resultCode, data);
+              }
+
+              @Override
+              protected void onSaveInstanceState(Bundle outState) {
+                  super.onSaveInstanceState(outState);
+                  web.saveState(outState);
+              }
+
+              @Override
+              protected void onPause() {
+                  super.onPause();
+                  CookieManager.getInstance().flush();
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (menuPopup != null && menuPopup.isShowing()) {
+                      menuPopup.dismiss();
+                  } else if (findBar.getVisibility() == View.VISIBLE) {
+                      closeFind();
+                  } else if (web.canGoBack()) {
+                      web.goBack();
+                  } else {
+                      super.onBackPressed();
+                  }
+              }
+          }
+          TICOO_EOF
+          cat > ticoo-android/app/src/main/java/org/ticoo/app/ReminderWorker.java <<'TICOO_EOF'
+          package org.ticoo.app;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.os.Build;
+
+          import androidx.work.Worker;
+          import androidx.work.WorkerParameters;
+
+          import org.json.JSONObject;
+
+          import java.io.BufferedReader;
+          import java.io.InputStreamReader;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+
+          // Every 12 hours: asks the site what to say ("Time to vote", off while no vote link is set),
+          // then shows a notification that opens the vote page (top.gg / botlist.me).
+          public class ReminderWorker extends Worker {
+
+              public ReminderWorker(Context context, WorkerParameters params) {
+                  super(context, params);
+              }
+
+              @Override
+              public Result doWork() {
+                  Context c = getApplicationContext();
+
+                  String title = "Time to vote for Ticoo";
+                  String text = "You can vote again on top.gg and botlist.me. It takes 10 seconds.";
+                  String url = "/vote";
+
+                  try {
+                      HttpURLConnection con = (HttpURLConnection)
+                              new URL(MainActivity.BASE + "/app/reminder.json").openConnection();
+                      con.setConnectTimeout(8000);
+                      con.setReadTimeout(8000);
+                      con.setRequestProperty("User-Agent", "TicooApp/1.0");
+                      if (con.getResponseCode() == 200) {
+                          StringBuilder sb = new StringBuilder();
+                          BufferedReader br = new BufferedReader(
+                                  new InputStreamReader(con.getInputStream(), "UTF-8"));
+                          String line;
+                          while ((line = br.readLine()) != null) {
+                              sb.append(line);
+                          }
+                          br.close();
+                          JSONObject o = new JSONObject(sb.toString());
+                          if (!o.optBoolean("enabled", true)) {
+                              con.disconnect();
+                              return Result.success();   // no vote link set: stay quiet
+                          }
+                          title = o.optString("title", title);
+                          text = o.optString("text", text);
+                          url = o.optString("url", url);
+                      }
+                      con.disconnect();
+                  } catch (Exception ignored) {
+                      // offline or server down: use the default text
+                  }
+
+                  NotificationManager nm =
+                          (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+                  String channelId = "ticoo_vote";
+
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      nm.createNotificationChannel(new NotificationChannel(
+                              channelId, "Vote reminders", NotificationManager.IMPORTANCE_DEFAULT));
+                  }
+
+                  Intent open = new Intent(c, MainActivity.class);
+                  open.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                  open.putExtra("url", url);
+                  PendingIntent pi = PendingIntent.getActivity(
+                          c, 0, open, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+
+                  Notification.Builder b = Build.VERSION.SDK_INT >= 26
+                          ? new Notification.Builder(c, channelId)
+                          : new Notification.Builder(c);
+                  b.setSmallIcon(android.R.drawable.ic_dialog_info)
+                          .setContentTitle(title)
+                          .setContentText(text)
+                          .setStyle(new Notification.BigTextStyle().bigText(text))
+                          .setContentIntent(pi)
+                          .setAutoCancel(true);
+
+                  nm.notify(1, b.build());
+                  return Result.success();
+              }
+          }
+          TICOO_EOF
+          cat > ticoo-android/app/src/main/res/drawable/ic_back.xml <<'TICOO_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#FFFFFFFF"
+                  android:pathData="M20,11H7.83l5.59,-5.59L12,4l-8,8 8,8 1.41,-1.41L7.83,13H20v-2z" />
+          </vector>
+          TICOO_EOF
+          cat > ticoo-android/app/src/main/res/drawable/ic_forward.xml <<'TICOO_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#FFFFFFFF"
+                  android:pathData="M12,4l-1.41,1.41L16.17,11H4v2h12.17l-5.58,5.59L12,20l8,-8z" />
+          </vector>
+          TICOO_EOF
+          cat > ticoo-android/app/src/main/res/drawable/ic_refresh.xml <<'TICOO_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#FFFFFFFF"
+                  android:pathData="M17.65,6.35C16.2,4.9 14.21,4 12,4c-4.42,0 -7.99,3.58 -7.99,8s3.57,8 7.99,8c3.73,0 6.84,-2.55 7.73,-6h-2.08c-0.82,2.33 -3.04,4 -5.65,4 -3.31,0 -6,-2.69 -6,-6s2.69,-6 6,-6c1.66,0 3.14,0.69 4.22,1.78L13,11h7V4l-2.35,2.35z" />
+          </vector>
+          TICOO_EOF
+          cat > ticoo-android/app/src/main/res/drawable/ic_close.xml <<'TICOO_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#FFFFFFFF"
+                  android:pathData="M19,6.41L17.59,5 12,10.59 6.41,5 5,6.41 10.59,12 5,17.59 6.41,19 12,13.41 17.59,19 19,17.59 13.41,12z" />
+          </vector>
+          TICOO_EOF
+          cat > ticoo-android/app/src/main/res/drawable/ic_home.xml <<'TICOO_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#FFFFFFFF"
+                  android:pathData="M10,20v-6h4v6h5v-8h3L12,3 2,12h3v8z" />
+          </vector>
+          TICOO_EOF
+          cat > ticoo-android/app/src/main/res/drawable/ic_more.xml <<'TICOO_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#FFFFFFFF"
+                  android:pathData="M12,8c1.1,0 2,-0.9 2,-2s-0.9,-2 -2,-2 -2,0.9 -2,2 0.9,2 2,2zM12,10c-1.1,0 -2,0.9 -2,2s0.9,2 2,2 2,-0.9 2,-2 -0.9,-2 -2,-2zM12,16c-1.1,0 -2,0.9 -2,2s0.9,2 2,2 2,-0.9 2,-2 -0.9,-2 -2,-2z" />
+          </vector>
+          TICOO_EOF
+          cat > ticoo-android/app/src/main/res/drawable/ic_desktop.xml <<'TICOO_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#FFFFFFFF"
+                  android:pathData="M21,2H3c-1.1,0 -2,0.9 -2,2v12c0,1.1 0.9,2 2,2h7v2H8v2h8v-2h-2v-2h7c1.1,0 2,-0.9 2,-2V4c0,-1.1 -0.9,-2 -2,-2zM21,16H3V4h18v12z" />
+          </vector>
+          TICOO_EOF
+          cat > ticoo-android/app/src/main/res/drawable/ic_share.xml <<'TICOO_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#FFFFFFFF"
+                  android:pathData="M18,16.08c-0.76,0 -1.44,0.3 -1.96,0.77L8.91,12.7c0.05,-0.23 0.09,-0.46 0.09,-0.7s-0.04,-0.47 -0.09,-0.7l7.05,-4.11c0.54,0.5 1.25,0.81 2.04,0.81 1.66,0 3,-1.34 3,-3s-1.34,-3 -3,-3 -3,1.34 -3,3c0,0.24 0.04,0.47 0.09,0.7L8.04,9.81C7.5,9.31 6.79,9 6,9c-1.66,0 -3,1.34 -3,3s1.34,3 3,3c0.79,0 1.5,-0.31 2.04,-0.81l7.12,4.16c-0.05,0.21 -0.08,0.43 -0.08,0.65 0,1.61 1.31,2.92 2.92,2.92 1.61,0 2.92,-1.31 2.92,-2.92s-1.31,-2.92 -2.92,-2.92z" />
+          </vector>
+          TICOO_EOF
+          cat > ticoo-android/app/src/main/res/drawable/ic_search.xml <<'TICOO_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#FFFFFFFF"
+                  android:pathData="M15.5,14h-0.79l-0.28,-0.27C15.41,12.59 16,11.11 16,9.5 16,5.91 13.09,3 9.5,3S3,5.91 3,9.5 5.91,16 9.5,16c1.61,0 3.09,-0.59 4.23,-1.57l0.27,0.28v0.79l5,4.99L20.49,19l-4.99,-5zM9.5,14C7.01,14 5,11.99 5,9.5S7.01,5 9.5,5 14,7.01 14,9.5 11.99,14 9.5,14z" />
+          </vector>
+          TICOO_EOF
+          cat > ticoo-android/app/src/main/res/drawable/ic_copy.xml <<'TICOO_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#FFFFFFFF"
+                  android:pathData="M16,1L4,1c-1.1,0 -2,0.9 -2,2v14h2L4,3h12L16,1zM19,5L8,5c-1.1,0 -2,0.9 -2,2v14c0,1.1 0.9,2 2,2h11c1.1,0 2,-0.9 2,-2L21,7c0,-1.1 -0.9,-2 -2,-2zM19,21L8,21L8,7h11v14z" />
+          </vector>
+          TICOO_EOF
+          cat > ticoo-android/app/src/main/res/drawable/ic_open.xml <<'TICOO_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#FFFFFFFF"
+                  android:pathData="M19,19H5V5h7V3H5c-1.11,0 -2,0.9 -2,2v14c0,1.1 0.89,2 2,2h14c1.1,0 2,-0.9 2,-2v-7h-2v7zM14,3v2h3.59l-9.83,9.83 1.41,1.41L19,6.41V10h2V3h-7z" />
+          </vector>
+          TICOO_EOF
+          cat > ticoo-android/app/src/main/res/drawable/ic_logout.xml <<'TICOO_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#FFFFFFFF"
+                  android:pathData="M17,7l-1.41,1.41L18.17,11H8v2h10.17l-2.58,2.58L17,17l5,-5zM4,5h8V3H4c-1.1,0 -2,0.9 -2,2v14c0,1.1 0.9,2 2,2h8v-2H4V5z" />
+          </vector>
+          TICOO_EOF
+          cat > ticoo-android/app/src/main/res/drawable/ic_lock.xml <<'TICOO_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#FFFFFFFF"
+                  android:pathData="M18,8h-1V6c0,-2.76 -2.24,-5 -5,-5S7,3.24 7,6v2H6c-1.1,0 -2,0.9 -2,2v10c0,1.1 0.9,2 2,2h12c1.1,0 2,-0.9 2,-2V10c0,-1.1 -0.9,-2 -2,-2zM12,17c-1.1,0 -2,-0.9 -2,-2s0.9,-2 2,-2 2,0.9 2,2 -0.9,2 -2,2zM15.1,8H8.9V6c0,-1.71 1.39,-3.1 3.1,-3.1 1.71,0 3.1,1.39 3.1,3.1v2z" />
+          </vector>
+          TICOO_EOF
+          cat > ticoo-android/app/src/main/res/drawable/ic_up.xml <<'TICOO_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#FFFFFFFF"
+                  android:pathData="M7.41,15.41L12,10.83l4.59,4.58L18,14l-6,-6 -6,6z" />
+          </vector>
+          TICOO_EOF
+          cat > ticoo-android/app/src/main/res/drawable/ic_down.xml <<'TICOO_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#FFFFFFFF"
+                  android:pathData="M7.41,8.59L12,13.17l4.59,-4.58L18,10l-6,6 -6,-6z" />
+          </vector>
+          TICOO_EOF
+
+      - name: Download app icon
+        run: |
+          set -e
+          curl -fsSL -A "Mozilla/5.0" -o ticoo-android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png https://ticoo.wispbyte.org/app/icon-512.png
+          head -c 4 ticoo-android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png | grep -aq PNG || { echo "Icon download failed"; exit 1; }
+
+      - name: Build APK
+        working-directory: ticoo-android
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Rename APK
+        run: cp ticoo-android/app/build/outputs/apk/debug/app-debug.apk Ticoo.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Ticoo-APK
+          path: Ticoo.apk
+
+      - name: Publish release
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Ticoo APK build ${{ github.run_number }}
+          files: Ticoo.apk
