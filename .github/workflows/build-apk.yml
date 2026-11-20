@@ -104,6 +104,12 @@ jobs:
                           <action android:name="android.intent.action.MAIN" />
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.VIEW" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <category android:name="android.intent.category.BROWSABLE" />
+                          <data android:scheme="https" android:host="ticoo.wispbyte.org" android:path="/app/" />
+                      </intent-filter>
                   </activity>
               </application>
           </manifest>
@@ -144,6 +150,7 @@ jobs:
           import android.view.inputmethod.EditorInfo;
           import android.view.inputmethod.InputMethodManager;
           import android.webkit.CookieManager;
+          import android.os.Message;
           import android.webkit.ValueCallback;
           import android.webkit.WebChromeClient;
           import android.webkit.WebResourceError;
@@ -161,6 +168,8 @@ jobs:
           import android.widget.TextView;
           import android.widget.Toast;
 
+          import androidx.work.Constraints;
+          import androidx.work.NetworkType;
           import androidx.work.ExistingPeriodicWorkPolicy;
           import androidx.work.PeriodicWorkRequest;
           import androidx.work.WorkManager;
@@ -182,9 +191,11 @@ jobs:
                       "botlist.me"
               };
 
-              // true  = any other site opens in the phone browser
-              // false = any other site opens inside the app too
-              static final boolean OPEN_OTHER_LINKS_EXTERNALLY = true;
+              // These always open in the matching phone app / browser.
+              static final String[] EXTERNAL_HOSTS = {
+                      "discord.gg", "t.me", "telegram.me", "wa.me", "play.google.com", "mediafire.com"
+              };
+              static final String APP_VERSION = "1.1";
 
               // Vote reminder interval in hours
               static final long REMINDER_HOURS = 12;
@@ -260,6 +271,10 @@ jobs:
                   s.setDisplayZoomControls(false);
                   s.setLoadWithOverviewMode(true);
                   s.setUseWideViewPort(true);
+                  s.setSupportMultipleWindows(true);
+                  s.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
+                  s.setMediaPlaybackRequiresUserGesture(true);
+                  s.setTextZoom(prefs.getInt("zoom", 100));
                   mobileUa = s.getUserAgentString().replace("; wv", "").replace("Version/4.0 ", "")
                           + " TicooApp/1.0";
                   applyMode();
@@ -273,6 +288,35 @@ jobs:
                       public void onProgressChanged(WebView view, int newProgress) {
                           progress.setProgress(newProgress);
                           progress.setVisibility(newProgress >= 100 ? View.INVISIBLE : View.VISIBLE);
+                      }
+
+                      @Override
+                      public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture,
+                                                    Message resultMsg) {
+                          // Popups only after a real tap (like Chrome's popup blocker). The page opens in this same view.
+                          if (!isUserGesture) return false;
+                          WebView temp = new WebView(MainActivity.this);
+                          temp.setWebViewClient(new WebViewClient() {
+                              @Override
+                              public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest request) {
+                                  handleUrl(request.getUrl(), true);
+                                  v.destroy();
+                                  return true;
+                              }
+
+                              @Override
+                              public void onPageStarted(WebView v, String url, Bitmap favicon) {
+                                  if (url != null && url.startsWith("http")) {
+                                      handleUrl(Uri.parse(url), true);
+                                      v.stopLoading();
+                                      v.destroy();
+                                  }
+                              }
+                          });
+                          WebView.WebViewTransport t = (WebView.WebViewTransport) resultMsg.obj;
+                          t.setWebView(temp);
+                          resultMsg.sendToTarget();
+                          return true;
                       }
 
                       @Override
@@ -295,15 +339,7 @@ jobs:
                   web.setWebViewClient(new WebViewClient() {
                       @Override
                       public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
-                          Uri u = request.getUrl();
-                          String scheme = u.getScheme();
-                          if ("http".equals(scheme) || "https".equals(scheme)) {
-                              if (isAllowed(u.getHost()) || !OPEN_OTHER_LINKS_EXTERNALLY) {
-                                  return false;
-                              }
-                          }
-                          openExternal(u);
-                          return true;
+                          return handleUrl(request.getUrl(), false);
                       }
 
                       @Override
@@ -569,6 +605,10 @@ jobs:
                           openExternal(Uri.parse(url));
                       }
                   }));
+                  menu.addView(menuItem(R.drawable.ic_settings, "Settings", null, v -> {
+                      closeMenu();
+                      web.loadUrl(settingsUrl());
+                  }));
                   menu.addView(divider());
                   menu.addView(menuItem(R.drawable.ic_logout, "Clear data and log out", null, v -> {
                       closeMenu();
@@ -733,6 +773,117 @@ jobs:
 
               // ---------- Helpers ----------
 
+              // Returns true when the app took care of the link. loadHere = load it in the main view.
+              private boolean handleUrl(Uri u, boolean loadHere) {
+                  String scheme = u.getScheme() == null ? "" : u.getScheme();
+                  String host = u.getHost() == null ? "" : u.getHost();
+                  if ("ticoo".equals(scheme)) {
+                      if (isTicooPage()) handleTicooAction(u);
+                      return true;
+                  }
+                  if ("http".equals(scheme) || "https".equals(scheme)) {
+                      // the Settings page address without state: open it with the current state
+                      if (host.equals("ticoo.wispbyte.org") && "/app/settings".equals(u.getPath())
+                              && u.getQueryParameter("zoom") == null) {
+                          web.loadUrl(settingsUrl());
+                          return true;
+                      }
+                      if (isExternalHost(host, u)) {
+                          openExternal(u);
+                          return true;
+                      }
+                      if (isAllowed(host) || prefs.getBoolean("inapp", true)) {
+                          if (loadHere) web.loadUrl(u.toString());
+                          return loadHere;
+                      }
+                      openExternal(u);
+                      return true;
+                  }
+                  if ("intent".equals(scheme)) {
+                      try {
+                          Intent in = Intent.parseUri(u.toString(), Intent.URI_INTENT_SCHEME);
+                          in.addCategory(Intent.CATEGORY_BROWSABLE);
+                          in.setComponent(null);
+                          in.setSelector(null);
+                          startActivity(in);
+                      } catch (Exception e) {
+                          // app not installed: try the fallback link
+                          try {
+                              Intent in = Intent.parseUri(u.toString(), Intent.URI_INTENT_SCHEME);
+                              String fb = in.getStringExtra("browser_fallback_url");
+                              if (fb != null && fb.startsWith("http")) web.loadUrl(fb);
+                          } catch (Exception ignored) {
+                          }
+                      }
+                      return true;
+                  }
+                  openExternal(u);
+                  return true;
+              }
+
+              private boolean isExternalHost(String host, Uri u) {
+                  for (String h : EXTERNAL_HOSTS) {
+                      if (host.equals(h) || host.endsWith("." + h)) return true;
+                  }
+                  return false;
+              }
+
+              private boolean isTicooPage() {
+                  String cur = web.getUrl();
+                  if (cur == null) return false;
+                  Uri c = Uri.parse(cur);
+                  return "https".equals(c.getScheme()) && "ticoo.wispbyte.org".equals(c.getHost());
+              }
+
+              private String settingsUrl() {
+                  return BASE + "/app/settings?ver=" + APP_VERSION
+                          + "&vote=" + (prefs.getBoolean("n_vote", true) ? 1 : 0)
+                          + "&upd=" + (prefs.getBoolean("n_upd", true) ? 1 : 0)
+                          + "&desk=" + (desktop ? 1 : 0)
+                          + "&inapp=" + (prefs.getBoolean("inapp", true) ? 1 : 0)
+                          + "&zoom=" + prefs.getInt("zoom", 100);
+              }
+
+              private void handleTicooAction(Uri u) {
+                  String host = u.getHost() == null ? "" : u.getHost();
+                  String arg = u.getPath() == null ? "" : u.getPath().replace("/", "");
+                  if (host.equals("toggle")) {
+                      if (arg.equals("vote")) {
+                          prefs.edit().putBoolean("n_vote", !prefs.getBoolean("n_vote", true)).apply();
+                      } else if (arg.equals("upd")) {
+                          prefs.edit().putBoolean("n_upd", !prefs.getBoolean("n_upd", true)).apply();
+                      } else if (arg.equals("inapp")) {
+                          prefs.edit().putBoolean("inapp", !prefs.getBoolean("inapp", true)).apply();
+                      } else if (arg.equals("desk")) {
+                          desktop = !desktop;
+                          prefs.edit().putBoolean("desktop", desktop).apply();
+                          applyMode();
+                      }
+                      web.loadUrl(settingsUrl());
+                  } else if (host.equals("zoom")) {
+                      int z = prefs.getInt("zoom", 100);
+                      if (arg.equals("up")) z = Math.min(150, z + 10);
+                      if (arg.equals("down")) z = Math.max(70, z - 10);
+                      prefs.edit().putInt("zoom", z).apply();
+                      web.getSettings().setTextZoom(z);
+                      web.loadUrl(settingsUrl());
+                  } else if (host.equals("do")) {
+                      if (arg.equals("test")) {
+                          ReminderWorker.notifyNow(this, "Ticoo", "Notifications work. You will get vote reminders and update alerts.", "/app/settings");
+                      } else if (arg.equals("cache")) {
+                          web.clearCache(true);
+                          Toast.makeText(this, "Cache cleared", Toast.LENGTH_SHORT).show();
+                      } else if (arg.equals("logout")) {
+                          clearData();
+                      } else if (arg.equals("share")) {
+                          Intent send = new Intent(Intent.ACTION_SEND);
+                          send.setType("text/plain");
+                          send.putExtra(Intent.EXTRA_TEXT, "Ticoo app: " + BASE + "/app/download");
+                          startActivity(Intent.createChooser(send, "Share"));
+                      }
+                  }
+              }
+
               private boolean isAllowed(String host) {
                   if (host == null) return false;
                   for (String h : ALLOWED_HOSTS) {
@@ -752,6 +903,7 @@ jobs:
               private String targetFromIntent(Intent in) {
                   if (in == null) return START_URL;
                   String u = in.getStringExtra("url");
+                  if ((u == null || u.isEmpty()) && in.getData() != null) u = in.getDataString();
                   if (u == null || u.isEmpty()) return START_URL;
                   if (u.startsWith("/")) return BASE + u;
                   Uri p = Uri.parse(u);
@@ -764,7 +916,7 @@ jobs:
                   super.onNewIntent(intent);
                   setIntent(intent);
                   String u = intent.getStringExtra("url");
-                  if (u != null && !u.isEmpty()) {
+                  if ((u != null && !u.isEmpty()) || intent.getData() != null) {
                       web.loadUrl(targetFromIntent(intent));
                   }
               }
@@ -781,6 +933,15 @@ jobs:
                           .build();
                   WorkManager.getInstance(this).enqueueUniquePeriodicWork(
                           "ticoo_reminder", ExistingPeriodicWorkPolicy.KEEP, req);
+
+                  // "Ticoo was updated" check, about once an hour
+                  PeriodicWorkRequest upd = new PeriodicWorkRequest.Builder(
+                          UpdateWorker.class, 1, TimeUnit.HOURS)
+                          .setConstraints(new Constraints.Builder()
+                                  .setRequiredNetworkType(NetworkType.CONNECTED).build())
+                          .build();
+                  WorkManager.getInstance(this).enqueueUniquePeriodicWork(
+                          "ticoo_update", ExistingPeriodicWorkPolicy.KEEP, upd);
               }
 
               @Override
@@ -854,6 +1015,9 @@ jobs:
               @Override
               public Result doWork() {
                   Context c = getApplicationContext();
+                  if (!c.getSharedPreferences("ticoo", Context.MODE_PRIVATE).getBoolean("n_vote", true)) {
+                      return Result.success();   // turned off in Settings
+                  }
 
                   String title = "Time to vote for Ticoo";
                   String text = "You can vote again on top.gg and botlist.me. It takes 10 seconds.";
@@ -888,35 +1052,67 @@ jobs:
                       // offline or server down: use the default text
                   }
 
+                  notifyNow(c, title, text, url);
+                  return Result.success();
+              }
+
+              static void notifyNow(Context c, String title, String text, String url) {
+                  show(c, title, text, url, "ticoo_vote", "Vote reminders", 1);
+              }
+
+              static void show(Context c, String title, String text, String url,
+                               String channelId, String channelName, int id) {
                   NotificationManager nm =
                           (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
-                  String channelId = "ticoo_vote";
-
                   if (Build.VERSION.SDK_INT >= 26) {
                       nm.createNotificationChannel(new NotificationChannel(
-                              channelId, "Vote reminders", NotificationManager.IMPORTANCE_DEFAULT));
+                              channelId, channelName, NotificationManager.IMPORTANCE_DEFAULT));
                   }
 
                   Intent open = new Intent(c, MainActivity.class);
                   open.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
                   open.putExtra("url", url);
                   PendingIntent pi = PendingIntent.getActivity(
-                          c, 0, open, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+                          c, id, open, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
 
                   Notification.Builder b = Build.VERSION.SDK_INT >= 26
                           ? new Notification.Builder(c, channelId)
                           : new Notification.Builder(c);
-                  b.setSmallIcon(android.R.drawable.ic_dialog_info)
+                  b.setSmallIcon(R.drawable.ic_notif)
                           .setContentTitle(title)
                           .setContentText(text)
                           .setStyle(new Notification.BigTextStyle().bigText(text))
                           .setContentIntent(pi)
                           .setAutoCancel(true);
-
-                  nm.notify(1, b.build());
-                  return Result.success();
+                  try {
+                      nm.notify(id, b.build());
+                  } catch (SecurityException ignored) {
+                      // notification permission not granted
+                  }
               }
           }
+          TICOO_EOF
+          cat > ticoo-android/app/src/main/res/drawable/ic_notif.xml <<'TICOO_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#FFFFFFFF"
+                  android:pathData="M12,22c1.1,0 2,-0.9 2,-2h-4c0,1.1 0.89,2 2,2zM18,16v-5c0,-3.07 -1.64,-5.64 -4.5,-6.32V4c0,-0.83 -0.67,-1.5 -1.5,-1.5s-1.5,0.67 -1.5,1.5v0.68C7.63,5.36 6,7.92 6,11v5l-2,2v1h16v-1l-2,-2z" />
+          </vector>
+          TICOO_EOF
+          cat > ticoo-android/app/src/main/res/drawable/ic_settings.xml <<'TICOO_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#FFFFFFFF"
+                  android:pathData="M19.14,12.94c0.04,-0.3 0.06,-0.61 0.06,-0.94 0,-0.32 -0.02,-0.64 -0.07,-0.94l2.03,-1.58c0.18,-0.14 0.23,-0.41 0.12,-0.61l-1.92,-3.32c-0.12,-0.22 -0.37,-0.29 -0.59,-0.22l-2.39,0.96c-0.5,-0.38 -1.03,-0.7 -1.62,-0.94L14.4,2.81c-0.04,-0.24 -0.24,-0.41 -0.48,-0.41h-3.84c-0.24,0 -0.43,0.17 -0.47,0.41L9.25,5.35C8.66,5.59 8.12,5.92 7.63,6.29L5.24,5.33c-0.22,-0.08 -0.47,0 -0.59,0.22L2.74,8.87C2.62,9.08 2.66,9.34 2.86,9.48l2.03,1.58C4.84,11.36 4.8,11.69 4.8,12s0.02,0.64 0.07,0.94l-2.03,1.58c-0.18,0.14 -0.23,0.41 -0.12,0.61l1.92,3.32c0.12,0.22 0.37,0.29 0.59,0.22l2.39,-0.96c0.5,0.38 1.03,0.7 1.62,0.94l0.36,2.54c0.05,0.24 0.24,0.41 0.48,0.41h3.84c0.24,0 0.44,-0.17 0.47,-0.41l0.36,-2.54c0.59,-0.24 1.13,-0.56 1.62,-0.94l2.39,0.96c0.22,0.08 0.47,0 0.59,-0.22l1.92,-3.32c0.12,-0.22 0.07,-0.47 -0.12,-0.61L19.14,12.94zM12,15.6c-1.98,0 -3.6,-1.62 -3.6,-3.6s1.62,-3.6 3.6,-3.6s3.6,1.62 3.6,3.6S13.98,15.6 12,15.6z" />
+          </vector>
           TICOO_EOF
           cat > ticoo-android/app/src/main/res/drawable/ic_back.xml <<'TICOO_EOF'
           <vector xmlns:android="http://schemas.android.com/apk/res/android"
@@ -1082,6 +1278,75 @@ jobs:
                   android:fillColor="#FFFFFFFF"
                   android:pathData="M7.41,8.59L12,13.17l4.59,-4.58L18,10l-6,6 -6,-6z" />
           </vector>
+          TICOO_EOF
+          cat > ticoo-android/app/src/main/java/org/ticoo/app/UpdateWorker.java <<'TICOO_EOF'
+          package org.ticoo.app;
+
+          import android.content.Context;
+          import android.content.SharedPreferences;
+
+          import androidx.work.Worker;
+          import androidx.work.WorkerParameters;
+
+          import org.json.JSONObject;
+
+          import java.io.BufferedReader;
+          import java.io.InputStreamReader;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+
+          // About once an hour: asks the site for the latest update id. A new id = "Ticoo was updated" notification.
+          // The first check only remembers the id (no notification right after installing).
+          public class UpdateWorker extends Worker {
+
+              public UpdateWorker(Context context, WorkerParameters params) {
+                  super(context, params);
+              }
+
+              @Override
+              public Result doWork() {
+                  Context c = getApplicationContext();
+                  SharedPreferences p = c.getSharedPreferences("ticoo", Context.MODE_PRIVATE);
+                  try {
+                      HttpURLConnection con = (HttpURLConnection)
+                              new URL(MainActivity.BASE + "/app/update.json").openConnection();
+                      con.setConnectTimeout(8000);
+                      con.setReadTimeout(8000);
+                      con.setRequestProperty("User-Agent", "TicooApp/1.0");
+                      if (con.getResponseCode() != 200) {
+                          con.disconnect();
+                          return Result.success();
+                      }
+                      StringBuilder sb = new StringBuilder();
+                      BufferedReader br = new BufferedReader(
+                              new InputStreamReader(con.getInputStream(), "UTF-8"));
+                      String line;
+                      while ((line = br.readLine()) != null) {
+                          sb.append(line);
+                      }
+                      br.close();
+                      con.disconnect();
+
+                      JSONObject o = new JSONObject(sb.toString());
+                      String id = o.optString("id", "");
+                      if (id.isEmpty()) return Result.success();
+
+                      String last = p.getString("last_update_id", null);
+                      p.edit().putString("last_update_id", id).apply();
+                      if (last == null || last.equals(id)) return Result.success();
+                      if (!p.getBoolean("n_upd", true)) return Result.success();
+
+                      ReminderWorker.show(c,
+                              o.optString("title", "Ticoo was updated"),
+                              o.optString("text", "Tap to see what's new."),
+                              o.optString("url", "/changelog"),
+                              "ticoo_update", "Update alerts", 2);
+                  } catch (Exception ignored) {
+                      // offline: try again next time
+                  }
+                  return Result.success();
+              }
+          }
           TICOO_EOF
 
       - name: Download app icon
